@@ -1,7 +1,34 @@
 import CoreNFC
 import Foundation
 
-/// Drives NFC tag sessions for both reading and writing NTAG215 tags.
+/// What (if anything) to do to a tag's protection bits after writing its NDEF
+/// message. Both options are off by default and set on the Write screen.
+enum TagProtection: Equatable {
+    /// Leave the tag freely rewritable.
+    case none
+    /// Set a 4-byte (32-bit) password. Rewriting later requires PWD_AUTH with
+    /// this password. Reversible if you know the password. NOTE: the password
+    /// crosses the RF link in plaintext — this deters casual rewrites, it is
+    /// not real security.
+    case password(Data)
+    /// Permanently set the tag read-only via the one-time-programmable lock
+    /// bits. This CANNOT be undone.
+    case permanentLock
+}
+
+/// Thrown when applying protection to a tag fails.
+enum ProtectionError: LocalizedError {
+    case passwordNotFourBytes
+
+    var errorDescription: String? {
+        switch self {
+            case .passwordNotFourBytes:
+                return "The password must be exactly 4 bytes (8 hex digits)."
+        }
+    }
+}
+
+/// Drives NFC tag sessions for both reading and writing NTAG21x-family tags.
 /// Uses `NFCTagReaderSession` so we can combine NDEF-level access with
 /// raw MIFARE Ultralight commands (GET_VERSION, FAST_READ).
 final class NFCService: NSObject, ObservableObject {
@@ -9,12 +36,15 @@ final class NFCService: NSObject, ObservableObject {
     @Published var lastScan: ScanResult?
     @Published var statusMessage: String?
     @Published var lastWriteSucceeded = false
+    /// A read/identification failure to surface as an alert dialog.
+    @Published var errorMessage: String?
     
     var isAvailable: Bool { NFCTagReaderSession.readingAvailable }
     
     private var session: NFCTagReaderSession?
     private var pendingWrite: NFCNDEFMessage?
-    
+    private var pendingProtection: TagProtection = .none
+
     private enum Mode { case read, write }
     private var mode: Mode = .read
     
@@ -25,13 +55,21 @@ final class NFCService: NSObject, ObservableObject {
         start(alert: "Hold your iPhone near the tag to read it.")
     }
     
-    func beginWrite(_ message: NFCNDEFMessage) {
+    func beginWrite(_ message: NFCNDEFMessage, protection: TagProtection = .none) {
         mode = .write
         pendingWrite = message
-        start(alert: "Hold your iPhone near the tag to write \(message.length) bytes.")
+        pendingProtection = protection
+        let suffix: String
+        switch protection {
+            case .none: suffix = ""
+            case .password: suffix = " and password-protect it"
+            case .permanentLock: suffix = " and permanently lock it"
+        }
+        start(alert: "Hold your iPhone near the tag to write \(message.length) bytes\(suffix).")
     }
     
     private func start(alert: String) {
+        errorMessage = nil
         guard isAvailable else {
             statusMessage = "NFC is not available on this device (requires a physical iPhone 7 or later)."
             return
@@ -63,6 +101,7 @@ final class NFCService: NSObject, ObservableObject {
             }
         } catch {
             session.invalidate(errorMessage: error.localizedDescription)
+            await MainActor.run { self.errorMessage = error.localizedDescription }
         }
     }
     
@@ -77,7 +116,7 @@ final class NFCService: NSObject, ObservableObject {
         } else {
             versionByte = nil
         }
-        let model = NTAG215Layout.model(forStorageByte: versionByte)
+        let model = try NTAG21xLayout.model(forStorageByte: versionByte)
         
         // 2. NDEF status + records.
         let (status, capacity) = try await tag.queryNDEFStatus()
@@ -145,7 +184,7 @@ final class NFCService: NSObject, ObservableObject {
         let (status, capacity) = try await tag.queryNDEFStatus()
         switch status {
             case .notSupported:
-                session.invalidate(errorMessage: "Tag is not NDEF formatted. Factory-fresh NTAG215 cards ship formatted; this one may be damaged or a different chip.")
+                session.invalidate(errorMessage: "Tag is not NDEF formatted. Factory-fresh NTAG21x cards ship formatted; this one may be damaged or a different chip.")
                 return
             case .readOnly:
                 session.invalidate(errorMessage: "Tag is permanently locked (read-only).")
@@ -158,13 +197,67 @@ final class NFCService: NSObject, ObservableObject {
             return
         }
         try await tag.writeNDEF(message)
-        session.alertMessage = "Write complete ✓ (\(message.length) of \(capacity) bytes used)"
+
+        // Apply protection (if any) after the NDEF message is safely written.
+        var protectionNote = ""
+        switch pendingProtection {
+            case .none:
+                break
+            case .password(let password):
+                let pages = try await chipPageCount(of: tag)
+                try await applyPassword(password, to: tag, totalPages: pages)
+                protectionNote = " · password set"
+            case .permanentLock:
+                try await tag.writeLock()
+                protectionNote = " · permanently locked"
+        }
+
+        session.alertMessage = "Write complete ✓ (\(message.length) of \(capacity) bytes)\(protectionNote)"
         session.invalidate()
         await MainActor.run {
             self.pendingWrite = nil
+            self.pendingProtection = .none
             self.lastWriteSucceeded = true
             self.statusMessage = nil
         }
+    }
+
+    // MARK: Protection
+
+    /// Re-runs GET_VERSION to learn the tag's page count, needed to locate the
+    /// configuration pages (which sit at the very end of memory).
+    private func chipPageCount(of tag: NFCMiFareTag) async throws -> Int {
+        let versionByte: UInt8?
+        if let version = try? await tag.sendMiFareCommand(commandPacket: Data([0x60])),
+           version.count >= 7 {
+            versionByte = version[6]
+        } else {
+            versionByte = nil
+        }
+        return try NTAG21xLayout.model(forStorageByte: versionByte).pages
+    }
+
+    /// Set a 32-bit password on the tag and require authentication for writes
+    /// from page 4 upward. Pages are read-modify-written so we don't clobber
+    /// the mirror/config bytes we aren't changing. AUTH0 is written LAST,
+    /// because once it takes effect the config pages themselves become
+    /// password-protected.
+    private func applyPassword(_ password: Data, to tag: NFCMiFareTag, totalPages n: Int) async throws {
+        guard password.count == 4 else { throw ProtectionError.passwordNotFourBytes }
+        let cfg0 = UInt8(n - 4)   // MIRROR / … / AUTH0 (byte 3)
+        let pwdPage = UInt8(n - 2)
+        let packPage = UInt8(n - 1)
+
+        // 1. PWD — the 4-byte password.
+        _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, pwdPage]) + password)
+        // 2. PACK — password acknowledge (0x0000) + RFUI.
+        _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, packPage, 0x00, 0x00, 0x00, 0x00]))
+        // 3. CFG0 — read current 4 bytes, then set AUTH0 (byte 3) = 0x04 so
+        //    pages 4+ require authentication for writes. PROT bit in CFG1 is
+        //    left at its default 0 = protect writes only (reads stay open).
+        let cfg0Read = try await tag.sendMiFareCommand(commandPacket: Data([0x30, cfg0])) // READ returns 16 bytes
+        guard cfg0Read.count >= 4 else { throw ProtectionError.passwordNotFourBytes }
+        _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, cfg0, cfg0Read[0], cfg0Read[1], cfg0Read[2], 0x04]))
     }
 }
 
@@ -189,7 +282,7 @@ extension NFCService: NFCTagReaderSessionDelegate {
     
     func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
         guard let first = tags.first, case let .miFare(tag) = first else {
-            session.invalidate(errorMessage: "Unsupported tag type — expected an NTAG215 (MIFARE Ultralight family).")
+            session.invalidate(errorMessage: "Unsupported tag type — expected an NTAG21x (MIFARE Ultralight family) tag.")
             return
         }
         Task {

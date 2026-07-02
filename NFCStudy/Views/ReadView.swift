@@ -14,13 +14,25 @@ struct ReadView: View {
             }
             .navigationTitle("Read Tag")
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        nfc.beginRead()
-                    } label: {
-                        Label("Scan", systemImage: "wave.3.forward.circle.fill")
+                ToolbarItem(placement: .topBarTrailing) {
+                    if nfc.lastScan != nil {
+                        Button("Done") { nfc.lastScan = nil }
+                    } else {
+                        Button {
+                            nfc.beginRead()
+                        } label: {
+                            Label("Scan", systemImage: "wave.3.forward.circle.fill")
+                        }
                     }
                 }
+            }
+            .alert("Couldn't read tag", isPresented: Binding(
+                get: { nfc.errorMessage != nil },
+                set: { if !$0 { nfc.errorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(nfc.errorMessage ?? "")
             }
         }
     }
@@ -30,9 +42,9 @@ struct ReadView: View {
             Image(systemName: "sensor.tag.radiowaves.forward")
                 .font(.system(size: 56))
                 .foregroundStyle(.tint)
-            Text("Scan an NTAG215 tag")
+            Text("Scan an NTAG21x tag")
                 .font(.title2.weight(.semibold))
-            Text("You'll see the tag's identity, every NDEF record broken down by category, and a raw dump of all 135 memory pages.")
+            Text("You'll see the tag's identity, every NDEF record broken down by category, and a raw dump of every memory page.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

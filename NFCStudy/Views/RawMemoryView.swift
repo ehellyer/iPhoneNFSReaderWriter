@@ -31,7 +31,7 @@ struct RawMemoryView: View {
         .padding(.vertical, 4)
     }
     
-    private func legendRow(_ region: NTAG215Layout.Region) -> some View {
+    private func legendRow(_ region: NTAG21xLayout.Region) -> some View {
         HStack(spacing: 8) {
             Circle().fill(region.color).frame(width: 8, height: 8)
             Text(region.rawValue)
@@ -39,7 +39,7 @@ struct RawMemoryView: View {
     }
     
     private func pageRow(_ index: Int) -> some View {
-        let region = NTAG215Layout.region(forPage: index, totalPages: totalPages)
+        let region = NTAG21xLayout.region(forPage: index, totalPages: totalPages)
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 10) {
                 Circle().fill(region.color).frame(width: 8, height: 8)
@@ -53,7 +53,7 @@ struct RawMemoryView: View {
                     .font(.system(.footnote, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
-            Text(NTAG215Layout.annotation(forPage: index, totalPages: totalPages))
+            Text(NTAG21xLayout.annotation(forPage: index, totalPages: totalPages))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .padding(.leading, 18)

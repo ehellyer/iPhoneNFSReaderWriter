@@ -1,18 +1,36 @@
 import SwiftUI
 
-/// Memory-map knowledge for the NTAG21x family (NTAG215 by default).
-/// Each page is 4 bytes. NTAG215 has 135 pages (540 bytes total),
-/// of which pages 4–129 (504 bytes) are user memory.
-enum NTAG215Layout {
-    
+/// Thrown when a scanned tag cannot be positively identified as a
+/// supported NTAG21x chip.
+enum TagIdentificationError: LocalizedError {
+    case getVersionFailed
+    case unsupportedChip(storageByte: UInt8)
+
+    var errorDescription: String? {
+        switch self {
+            case .getVersionFailed:
+                return "The tag did not answer the GET_VERSION command, so its chip type could not be identified. It may not be an NTAG21x tag."
+            case .unsupportedChip(let storageByte):
+                return String(format: "Unsupported chip: GET_VERSION reported storage-size byte 0x%02X, which is not an NTAG213, NTAG215, or NTAG216.", storageByte)
+        }
+    }
+}
+
+/// Memory-map knowledge for the NTAG21x family (NTAG213 / NTAG215 / NTAG216).
+/// Each page is 4 bytes and the layout is identical across the family:
+/// UID and lock bytes, then the Capability Container, then user memory,
+/// then five trailing configuration pages. Only the amount of user memory
+/// in the middle differs by model.
+enum NTAG21xLayout {
+
     enum Region: String {
-        
+
         case uid = "UID / manufacturer"
         case lock = "Lock bytes"
         case capability = "Capability Container"
         case user = "User memory"
         case config = "Configuration"
-        
+
         var color: Color {
             switch self {
                 case .uid: return .blue
@@ -23,7 +41,7 @@ enum NTAG215Layout {
             }
         }
     }
-    
+
     static func region(forPage page: Int, totalPages: Int) -> Region {
         switch page {
             case 0, 1: return .uid
@@ -34,7 +52,7 @@ enum NTAG215Layout {
             default: return .user
         }
     }
-    
+
     static func annotation(forPage page: Int, totalPages: Int) -> String {
         switch page {
             case 0: return "UID bytes 0–2 + check byte 0"
@@ -49,14 +67,16 @@ enum NTAG215Layout {
             default: return "User memory (NDEF TLVs live here)"
         }
     }
-    
+
     /// Map the GET_VERSION storage-size byte to a model name and page count.
-    static func model(forStorageByte byte: UInt8?) -> (name: String, pages: Int) {
+    /// Throws `TagIdentificationError` if the byte is missing or unrecognized.
+    static func model(forStorageByte byte: UInt8?) throws -> (name: String, pages: Int) {
+        guard let byte else { throw TagIdentificationError.getVersionFailed }
         switch byte {
             case 0x0F: return ("NTAG213", 45)
             case 0x11: return ("NTAG215", 135)
             case 0x13: return ("NTAG216", 231)
-            default: return ("NTAG21x (unrecognized)", 135)
+            default: throw TagIdentificationError.unsupportedChip(storageByte: byte)
         }
     }
 }

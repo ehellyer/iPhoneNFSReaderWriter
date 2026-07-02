@@ -255,7 +255,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NFCReaderUsageDescription = "NFC Study reads and writes NTAG215 tags so you can learn how NFC and NDEF work.";
+				INFOPLIST_KEY_NFCReaderUsageDescription = "NFC Study reads and writes NTAG21x-family tags so you can learn how NFC and NDEF work.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -285,7 +285,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NFCReaderUsageDescription = "NFC Study reads and writes NTAG215 tags so you can learn how NFC and NDEF work.";
+				INFOPLIST_KEY_NFCReaderUsageDescription = "NFC Study reads and writes NTAG21x-family tags so you can learn how NFC and NDEF work.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
