@@ -14,7 +14,7 @@ An educational SwiftUI app for reading and writing NTAG21x-family NFC tags (NTAG
 ## Getting started
 
 1. Open `NFCStudy.xcodeproj` in Xcode.
-2. Select the **NFCStudy** target → **Signing & Capabilities** → choose your **Team**. Xcode will register the bundle ID `com.hellyermultimedia.nfcstudy` and provision the *Near Field Communication Tag Reading* capability automatically.
+2. Select the **NFCStudy** target → **Signing & Capabilities** → choose your **Team**. Set your bundle ID, you cannot use `com.hellyermultimedia.nfcstudy` and provision the *Near Field Communication Tag Reading* capability automatically.
 3. Plug in your iPhone, select it as the run destination, and press **Run**.
 4. On first launch on-device you may need to trust the developer certificate: Settings → General → VPN & Device Management.
 
