@@ -23,14 +23,16 @@ enum ProtectionError: LocalizedError {
     var errorDescription: String? {
         switch self {
             case .passwordNotFourBytes:
-                return "The password must be exactly 4 bytes (8 hex digits)."
+                return "The password must be exactly 4 bytes (up to 4 characters)."
         }
     }
 }
 
 /// Drives NFC tag sessions for both reading and writing NTAG21x-family tags.
-/// Uses `NFCTagReaderSession` so we can combine NDEF-level access with
-/// raw MIFARE Ultralight commands (GET_VERSION, FAST_READ).
+/// Uses `NFCTagReaderSession` so we can combine high-level NDEF access with
+/// raw MIFARE Ultralight commands (GET_VERSION, FAST_READ, READ, WRITE,
+/// PWD_AUTH). Unprotected writes go through the high-level `writeNDEF`; writes
+/// to password-protected tags stay entirely in the raw channel (see `write`).
 final class NFCService: NSObject, ObservableObject {
     
     @Published var lastScan: ScanResult?
@@ -44,6 +46,12 @@ final class NFCService: NSObject, ObservableObject {
     private var session: NFCTagReaderSession?
     private var pendingWrite: NFCNDEFMessage?
     private var pendingProtection: TagProtection = .none
+    /// If set, authenticate with this 4-byte password (PWD_AUTH) before writing,
+    /// so we can rewrite a tag that was previously password-protected.
+    private var pendingAuthPassword: Data?
+    /// NDEF capacity captured from the last read, used by the authenticated
+    /// write path (which can't call queryNDEFStatus to learn it live).
+    private var pendingWriteCapacityFallback: Int?
 
     private enum Mode { case read, write }
     private var mode: Mode = .read
@@ -55,10 +63,14 @@ final class NFCService: NSObject, ObservableObject {
         start(alert: "Hold your iPhone near the tag to read it.")
     }
     
-    func beginWrite(_ message: NFCNDEFMessage, protection: TagProtection = .none) {
+    func beginWrite(_ message: NFCNDEFMessage,
+                    protection: TagProtection = .none,
+                    authPassword: Data? = nil) {
         mode = .write
         pendingWrite = message
         pendingProtection = protection
+        pendingAuthPassword = authPassword
+        pendingWriteCapacityFallback = lastScan?.info.ndefCapacity
         let suffix: String
         switch protection {
             case .none: suffix = ""
@@ -69,9 +81,13 @@ final class NFCService: NSObject, ObservableObject {
     }
     
     private func start(alert: String) {
+        // Clear any prior error each time we start; this is what makes the
+        // "NFC unavailable" state resettable — it's re-evaluated on every
+        // attempt, and the message below is shown via a dismissible alert.
         errorMessage = nil
+        statusMessage = nil
         guard isAvailable else {
-            statusMessage = "NFC is not available on this device (requires a physical iPhone 7 or later)."
+            errorMessage = "NFC is not available on this device. Core NFC needs a physical iPhone 7 or later — it does not work in the Simulator."
             return
         }
         session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self, queue: nil)
@@ -142,13 +158,33 @@ final class NFCService: NSObject, ObservableObject {
         
         // 3. Raw memory dump via FAST_READ (0x3A), in 32-page chunks.
         let pages = await readAllPages(from: tag, totalPages: model.pages)
-        
+
+        // 4. Detect password protection from the config pages. `queryNDEFStatus`
+        //    reports read/write because the Capability Container is still
+        //    read/write — NTAG password protection is enforced separately via
+        //    AUTH0 (CFG0) and the ACCESS byte (CFG1), so we inspect them here.
+        var writable = (status == .readWrite)
+        if writable,
+           model.pages >= 4,
+           pages.count >= model.pages,
+           pages[model.pages - 4].count == 4,
+           pages[model.pages - 3].count == 4 {
+            let auth0 = Int(pages[model.pages - 4][3])         // first page requiring auth
+            let readProtected = (pages[model.pages - 3][0] & 0x80) != 0  // ACCESS PROT bit
+            if auth0 < model.pages {                            // protection is active
+                writable = false
+                statusDescription = "NDEF, password-protected ("
+                    + (readProtected ? "read & write" : "write only")
+                    + ", from page \(auth0))"
+            }
+        }
+
         let info = TagInfo(uidHex: tag.identifier.map { String(format: "%02X", $0) }.joined(separator: ":"),
                            model: model.name,
                            totalPages: model.pages,
                            ndefCapacity: capacity,
                            statusDescription: statusDescription,
-                           isWritable: status == .readWrite)
+                           isWritable: writable)
         return ScanResult(info: info, records: records, pages: pages)
     }
     
@@ -181,28 +217,71 @@ final class NFCService: NSObject, ObservableObject {
             session.invalidate(errorMessage: "Nothing queued to write.")
             return
         }
-        let (status, capacity) = try await tag.queryNDEFStatus()
-        switch status {
-            case .notSupported:
-                session.invalidate(errorMessage: "Tag is not NDEF formatted. Factory-fresh NTAG21x cards ship formatted; this one may be damaged or a different chip.")
+
+        // Capacity to report (and, on the raw path, to guard against). The
+        // authenticated path can't call queryNDEFStatus (see below), so it
+        // falls back to the capacity learned during the last read.
+        var capacity = pendingWriteCapacityFallback ?? message.length
+
+        if let authBytes = pendingAuthPassword {
+            // AUTHENTICATED PATH — stay ENTIRELY in the raw MIFARE channel.
+            // Once we send a raw PWD_AUTH we must NOT call any high-level NDEF
+            // method (queryNDEFStatus / writeNDEF). Interleaving one corrupts
+            // the session and the next raw transceive returns "Tag connection
+            // lost". So: PWD_AUTH, then raw WRITE (0xA2), nothing in between.
+            do {
+                _ = try await tag.sendMiFareCommand(commandPacket: Data([0x1B]) + authBytes)
+            } catch {
+                session.invalidate(errorMessage: "Authentication failed — that password doesn't match this tag.")
+                await MainActor.run {
+                    self.pendingAuthPassword = nil
+                    self.errorMessage = "Authentication failed — that password doesn't match this tag."
+                }
                 return
-            case .readOnly:
-                session.invalidate(errorMessage: "Tag is permanently locked (read-only).")
+            }
+
+            guard message.length <= capacity else {
+                session.invalidate(errorMessage: "Message is \(message.length) bytes but the tag holds only \(capacity) bytes.")
                 return
-            default:
-                break
+            }
+
+            let ndef = Self.serializeNDEFMessage(message)
+            let tlv = Self.wrapInType2TLV(ndef)
+            try await rawWriteUserMemory(tlv, to: tag)
+        } else {
+            // UNAUTHENTICATED PATH — high-level NDEF calls are fine here.
+            let (status, cap) = try await tag.queryNDEFStatus()
+            switch status {
+                case .notSupported:
+                    session.invalidate(errorMessage: "Tag is not NDEF formatted. Factory-fresh NTAG21x cards ship formatted; this one may be damaged or a different chip.")
+                    return
+                case .readOnly:
+                    session.invalidate(errorMessage: "Tag is permanently locked (read-only).")
+                    return
+                default:
+                    break
+            }
+            capacity = cap
+            guard message.length <= capacity else {
+                session.invalidate(errorMessage: "Message is \(message.length) bytes but the tag holds only \(capacity) bytes.")
+                return
+            }
+            try await tag.writeNDEF(message)
         }
-        guard message.length <= capacity else {
-            session.invalidate(errorMessage: "Message is \(message.length) bytes but the tag holds only \(capacity) bytes.")
-            return
-        }
-        try await tag.writeNDEF(message)
 
         // Apply protection (if any) after the NDEF message is safely written.
         var protectionNote = ""
         switch pendingProtection {
             case .none:
-                break
+                // If we authenticated an already-protected tag and no new
+                // protection was chosen, remove the existing protection so the
+                // card ends up freely rewritable again. (All raw commands —
+                // we're still in the authenticated raw channel here.)
+                if pendingAuthPassword != nil {
+                    let pages = try await chipPageCount(of: tag)
+                    try await clearPassword(to: tag, totalPages: pages)
+                    protectionNote = " · password cleared"
+                }
             case .password(let password):
                 let pages = try await chipPageCount(of: tag)
                 try await applyPassword(password, to: tag, totalPages: pages)
@@ -217,6 +296,8 @@ final class NFCService: NSObject, ObservableObject {
         await MainActor.run {
             self.pendingWrite = nil
             self.pendingProtection = .none
+            self.pendingAuthPassword = nil
+            self.pendingWriteCapacityFallback = nil
             self.lastWriteSucceeded = true
             self.statusMessage = nil
         }
@@ -258,6 +339,90 @@ final class NFCService: NSObject, ObservableObject {
         let cfg0Read = try await tag.sendMiFareCommand(commandPacket: Data([0x30, cfg0])) // READ returns 16 bytes
         guard cfg0Read.count >= 4 else { throw ProtectionError.passwordNotFourBytes }
         _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, cfg0, cfg0Read[0], cfg0Read[1], cfg0Read[2], 0x04]))
+    }
+
+    /// Remove password protection: set AUTH0 (CFG0 byte 3) back to 0xFF so no
+    /// page requires authentication, and reset PWD/PACK to their factory
+    /// defaults (FF FF FF FF / 00 00). The session must already be
+    /// authenticated — this runs on the raw write path, so it is.
+    private func clearPassword(to tag: NFCMiFareTag, totalPages n: Int) async throws {
+        let cfg0 = UInt8(n - 4)
+        let pwdPage = UInt8(n - 2)
+        let packPage = UInt8(n - 1)
+
+        // Reset PWD and PACK to factory defaults.
+        _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, pwdPage, 0xFF, 0xFF, 0xFF, 0xFF]))
+        _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, packPage, 0x00, 0x00, 0x00, 0x00]))
+        // Disable protection: AUTH0 = 0xFF (read-modify-write, keeping the
+        // other CFG0 bytes). Written last so protection is off only once the
+        // password has been reset.
+        let cfg0Read = try await tag.sendMiFareCommand(commandPacket: Data([0x30, cfg0]))
+        guard cfg0Read.count >= 4 else { throw ProtectionError.passwordNotFourBytes }
+        _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, cfg0, cfg0Read[0], cfg0Read[1], cfg0Read[2], 0xFF]))
+    }
+
+    // MARK: Raw NDEF writing (used on authenticated / password-protected tags)
+
+    /// Serialize an NDEF message to its raw byte form (record header flags,
+    /// type/payload lengths, then type and payload bytes).
+    static func serializeNDEFMessage(_ message: NFCNDEFMessage) -> Data {
+        var out = Data()
+        let count = message.records.count
+        for (i, r) in message.records.enumerated() {
+            var flags: UInt8 = r.typeNameFormat.rawValue & 0x07  // TNF
+            if i == 0 { flags |= 0x80 }                 // MB — message begin
+            if i == count - 1 { flags |= 0x40 }         // ME — message end
+            let shortRecord = r.payload.count < 256
+            if shortRecord { flags |= 0x10 }            // SR — short record
+            if !r.identifier.isEmpty { flags |= 0x08 }  // IL — ID length present
+            out.append(flags)
+            out.append(UInt8(r.type.count))
+            if shortRecord {
+                out.append(UInt8(r.payload.count))
+            } else {
+                let len = UInt32(r.payload.count)
+                out.append(UInt8((len >> 24) & 0xFF))
+                out.append(UInt8((len >> 16) & 0xFF))
+                out.append(UInt8((len >> 8) & 0xFF))
+                out.append(UInt8(len & 0xFF))
+            }
+            if !r.identifier.isEmpty { out.append(UInt8(r.identifier.count)) }
+            out.append(r.type)
+            if !r.identifier.isEmpty { out.append(r.identifier) }
+            out.append(r.payload)
+        }
+        return out
+    }
+
+    /// Wrap raw NDEF bytes in a Type-2 NDEF-message TLV (0x03 length … 0xFE)
+    /// and zero-pad to a 4-byte page boundary.
+    static func wrapInType2TLV(_ ndef: Data) -> Data {
+        var tlv = Data([0x03])
+        if ndef.count < 0xFF {
+            tlv.append(UInt8(ndef.count))
+        } else {
+            tlv.append(0xFF)
+            tlv.append(UInt8((ndef.count >> 8) & 0xFF))
+            tlv.append(UInt8(ndef.count & 0xFF))
+        }
+        tlv.append(ndef)
+        tlv.append(0xFE) // terminator TLV
+        while tlv.count % 4 != 0 { tlv.append(0x00) }
+        return tlv
+    }
+
+    /// Write a byte buffer into user memory starting at page 4, one 4-byte page
+    /// at a time via the raw WRITE (0xA2) command.
+    private func rawWriteUserMemory(_ data: Data, to tag: NFCMiFareTag) async throws {
+        var page = 4
+        var offset = 0
+        while offset < data.count {
+            var chunk = data.subdata(in: offset..<Swift.min(offset + 4, data.count))
+            while chunk.count < 4 { chunk.append(0x00) }
+            _ = try await tag.sendMiFareCommand(commandPacket: Data([0xA2, UInt8(page)]) + chunk)
+            page += 1
+            offset += 4
+        }
     }
 }
 

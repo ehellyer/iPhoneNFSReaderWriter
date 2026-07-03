@@ -9,8 +9,12 @@ struct WriteView: View {
 
     // Card protection — both off by default.
     @State private var protectionChoice: ProtectionChoice = .none
-    @State private var passwordHex = ""
+    @State private var passwordText = ""
     @State private var showLockWarning = false
+
+    // Authenticating to an already-protected tag before writing — off by default.
+    @State private var useExistingPassword = false
+    @State private var existingPasswordText = ""
 
     enum ProtectionChoice: String, CaseIterable, Identifiable {
         case none = "None"
@@ -32,10 +36,31 @@ struct WriteView: View {
         return estimatedBytes > capacity
     }
 
-    /// The 4-byte password, or nil if the hex field isn't exactly 8 hex digits.
-    private var passwordData: Data? {
-        guard let data = Data(hexString: passwordHex), data.count == 4 else { return nil }
+    /// NTAG passwords are exactly 4 bytes. Convert a user string (already
+    /// capped to ≤ 4 UTF-8 bytes) into that 4-byte value, padding short
+    /// passwords with zero bytes. Setting and authenticating share this so
+    /// the same typed text always maps to the same password.
+    private func passwordBytes(_ text: String) -> Data {
+        var data = Data(text.utf8.prefix(4))
+        while data.count < 4 { data.append(0x00) }
         return data
+    }
+
+    /// Trim a string so its UTF-8 encoding never exceeds 4 bytes.
+    private func cappedToFourBytes(_ text: String) -> String {
+        var trimmed = text
+        while Data(trimmed.utf8).count > 4 { trimmed.removeLast() }
+        return trimmed
+    }
+
+    /// The 4-byte password to set, or nil if the field is empty.
+    private var passwordData: Data? {
+        passwordText.isEmpty ? nil : passwordBytes(passwordText)
+    }
+
+    /// The password to authenticate with before writing, if enabled.
+    private var authPassword: Data? {
+        (useExistingPassword && !existingPasswordText.isEmpty) ? passwordBytes(existingPasswordText) : nil
     }
 
     /// Resolve the UI choice into the service's protection type.
@@ -47,9 +72,11 @@ struct WriteView: View {
         }
     }
 
-    /// Whether the write button should be blocked by an incomplete protection setup.
+    /// Whether the write button should be blocked by an incomplete setup:
+    /// a chosen-but-empty new password, or "protected" toggled on with no password.
     private var protectionIncomplete: Bool {
-        protectionChoice == .password && passwordData == nil
+        (protectionChoice == .password && passwordData == nil)
+            || (useExistingPassword && existingPasswordText.isEmpty)
     }
     
     var body: some View {
@@ -66,14 +93,18 @@ struct WriteView: View {
                 }
                 
                 formSection
-                
+
                 queueSection
+
+                authenticationSection
 
                 protectionSection
 
                 Section {
                     Button {
-                        nfc.beginWrite(NFCNDEFMessage(records: queued), protection: protection)
+                        nfc.beginWrite(NFCNDEFMessage(records: queued),
+                                       protection: protection,
+                                       authPassword: authPassword)
                     } label: {
                         Label("Write \(queued.count) record\(queued.count == 1 ? "" : "s") to tag",
                               systemImage: "wave.3.forward.circle.fill")
@@ -100,7 +131,9 @@ struct WriteView: View {
                 if success {
                     queued.removeAll()
                     protectionChoice = .none
-                    passwordHex = ""
+                    passwordText = ""
+                    useExistingPassword = false
+                    existingPasswordText = ""
                     showWriteSuccess = true
                     nfc.lastWriteSucceeded = false
                 }
@@ -116,6 +149,32 @@ struct WriteView: View {
             } message: {
                 Text("Permanent locking sets the tag's one-time-programmable lock bits. Once you write with this enabled, the tag can NEVER be rewritten or unlocked — on any device. This is irreversible.")
             }
+            .alert("NFC problem", isPresented: Binding(
+                get: { nfc.errorMessage != nil },
+                set: { if !$0 { nfc.errorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(nfc.errorMessage ?? "")
+            }
+        }
+    }
+
+    private var authenticationSection: some View {
+        Section {
+            Toggle("Tag is password-protected", isOn: $useExistingPassword)
+            if useExistingPassword {
+                TextField("Existing password (up to 4 characters)", text: $existingPasswordText)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .onChange(of: existingPasswordText) { _, newValue in
+                        existingPasswordText = cappedToFourBytes(newValue)
+                    }
+            }
+        } header: {
+            Text("Existing protection")
+        } footer: {
+            Text("If this tag was already password-protected, turn this on and enter its password. The write authenticates first (PWD_AUTH), then updates the tag. If you leave “Card protection” below on None, the existing password is removed after writing; choose Password there to set a new one instead.")
         }
     }
 
@@ -125,15 +184,12 @@ struct WriteView: View {
                 ForEach(ProtectionChoice.allCases) { Text($0.rawValue).tag($0) }
             }
             if protectionChoice == .password {
-                TextField("Password (8 hex digits, e.g. FF00AA55)", text: $passwordHex)
-                    .textInputAutocapitalization(.characters)
+                TextField("Password (up to 4 characters)", text: $passwordText)
+                    .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .font(.system(.body, design: .monospaced))
-                if !passwordHex.isEmpty && passwordData == nil {
-                    Text("Enter exactly 8 hexadecimal digits (a 4-byte password).")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                }
+                    .onChange(of: passwordText) { _, newValue in
+                        passwordText = cappedToFourBytes(newValue)
+                    }
             }
         } header: {
             Text("Card protection")
@@ -142,7 +198,7 @@ struct WriteView: View {
                 case .none:
                     Text("The tag stays freely rewritable.")
                 case .password:
-                    Text("Sets a 32-bit password; rewriting later requires it. The password crosses the air gap in plaintext, so this deters casual rewrites rather than providing real security. Store the password — there's no recovery.")
+                    Text("Sets a 32-bit (4-byte) password; up to 4 characters, padded with zeros if shorter. Rewriting later requires it via the “Existing protection” option above. The password crosses the air gap in plaintext, so this deters casual rewrites rather than providing real security — and there's no recovery, so store it.")
                 case .permanentLock:
                     Text("Writes the message, then permanently locks the tag to read-only. This cannot be undone.")
             }
