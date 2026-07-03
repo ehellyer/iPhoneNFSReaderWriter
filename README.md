@@ -18,8 +18,6 @@ An educational SwiftUI app for reading and writing NTAG21x-family NFC tags (NTAG
 3. Plug in your iPhone, select it as the run destination, and press **Run**.
 4. On first launch on-device you may need to trust the developer certificate: Settings → General → VPN & Device Management.
 
-> This project lives in iCloud Drive. iCloud can lag behind your edits, so after changing source do a **Clean Build Folder** (⇧⌘K) before Run to avoid running a stale binary.
-
 ## What the app does
 
 **Read tab** — starts an `NFCTagReaderSession` and, once a tag is detected:
