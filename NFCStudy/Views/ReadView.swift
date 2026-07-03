@@ -1,3 +1,10 @@
+//
+//  ReadView.swift
+//  NFCStudy
+//
+//  Created by Ed Hellyer on 7/3/26.
+//
+
 import SwiftUI
 
 struct ReadView: View {

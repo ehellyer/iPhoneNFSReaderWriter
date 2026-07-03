@@ -1,3 +1,10 @@
+//
+//  RecordCategory.swift
+//  NFCStudy
+//
+//  Created by Ed Hellyer on 7/3/26.
+//
+
 import SwiftUI
 
 /// The record "categories" the app understands, used by both the read

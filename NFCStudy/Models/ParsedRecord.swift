@@ -1,3 +1,10 @@
+//
+//  ParsedRecord.swift
+//  NFCStudy
+//
+//  Created by Ed Hellyer on 7/3/26.
+//
+
 import Foundation
 
 /// A fully decoded NDEF record, broken into human-readable fields.

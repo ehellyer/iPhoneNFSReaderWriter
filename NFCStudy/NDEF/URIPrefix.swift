@@ -1,3 +1,10 @@
+//
+//  URIPrefix.swift
+//  NFCStudy
+//
+//  Created by Ed Hellyer on 7/3/26.
+//
+
 import Foundation
 
 /// NFC Forum URI Record Type Definition prefix abbreviation table.

@@ -1,3 +1,10 @@
+//
+//  NTAG21xLayout.swift
+//  NFCStudy
+//
+//  Created by Ed Hellyer on 7/3/26.
+//
+
 import SwiftUI
 
 /// Thrown when a scanned tag cannot be positively identified as a

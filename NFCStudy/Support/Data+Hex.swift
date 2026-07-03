@@ -1,3 +1,10 @@
+//
+//  Data+Hex.swift
+//  NFCStudy
+//
+//  Created by Ed Hellyer on 7/3/26.
+//
+
 import Foundation
 
 extension Data {
